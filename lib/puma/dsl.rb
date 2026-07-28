@@ -1105,6 +1105,39 @@ module Puma
       @options[:preload_app] = answer
     end
 
+    # When enabled, Puma calls [`Process.warmup`](https://docs.ruby-lang.org/en/master/Process.html#method-c-warmup)
+    # (Ruby 3.3+) in the cluster master immediately before it forks the first
+    # worker, and again in worker 0 immediately before each refork when
+    # `fork_worker` is enabled (right after the `before_refork` hooks run).
+    # `Process.warmup` runs a full GC, compacts and promotes the heap, and
+    # pre-frees empty pages, so the pages shared with workers via
+    # copy-on-write start out compact instead of being dirtied by each
+    # worker's first GC cycle.
+    #
+    # This is a no-op (logged at `--debug`) on Ruby versions where
+    # `Process.warmup` doesn't exist, so it's safe to leave enabled across
+    # Ruby versions.
+    #
+    # Compaction can surface latent bugs in C extensions that are not
+    # compaction-safe; test before enabling in production.
+    #
+    # The default is +false+.
+    #
+    # Accepts a literal +true+ or +false+ only -- anything else (e.g. a
+    # string or +nil+) raises +ArgumentError+, since this is a safety
+    # escape-hatch that should fail loudly on a typo rather than silently
+    # coercing to a truthy/falsy value.
+    #
+    # @note Cluster mode only.
+    #
+    # @example
+    #   warmup_before_fork
+    #
+    def warmup_before_fork(enabled = true)
+      raise ArgumentError, "warmup_before_fork must be true or false" unless [true, false].include?(enabled)
+      @options[:warmup_before_fork] = enabled
+    end
+
     # Use +obj+ or +block+ as the low level error handler. This allows the
     # configuration file to change the default error on the server.
     #

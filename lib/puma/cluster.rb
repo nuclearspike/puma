@@ -437,6 +437,8 @@ module Puma
 
       @config.run_hooks(:before_fork, nil, @log_writer)
 
+      warmup_before_fork
+
       spawn_workers
 
       Signal.trap "SIGINT" do
@@ -553,6 +555,29 @@ module Puma
       log "! Running Puma in cluster mode with a single worker is often a misconfiguration."
       log "! Consider running Puma in single-mode (workers = 0) in order to reduce memory overhead."
       log "! Set the `silence_single_worker_warning` option to silence this warning message."
+    end
+
+    # Called once in the master immediately before the first worker fork (and
+    # once per refork by `Cluster::Worker`, see cluster/worker.rb), so the
+    # heap that gets shared with workers via copy-on-write is freshly GC'd,
+    # compacted, and promoted before it's forked/re-forked. No-op (besides a
+    # debug log line) if disabled, or if the running Ruby doesn't support
+    # `Process.warmup` (added in Ruby 3.3). Any exception raised by
+    # `Process.warmup` itself is rescued and logged (via `log`, not `error`
+    # -- `LogWriter#error` calls `exit 1`, which would defeat the point of
+    # continuing boot) rather than propagated, so a bug in the GC/compaction
+    # path can't take down boot.
+    def warmup_before_fork
+      return unless @options[:warmup_before_fork]
+
+      if Process.respond_to?(:warmup)
+        Process.warmup
+      else
+        debug "warmup_before_fork is enabled, but Process.warmup is not available " \
+          "on this Ruby version (added in Ruby 3.3); skipping"
+      end
+    rescue StandardError => e
+      log "! Process.warmup raised #{e.class}: #{e.message} — continuing boot without warmup"
     end
 
     # loops thru @workers, removing workers that exited, and calling

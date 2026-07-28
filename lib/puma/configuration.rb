@@ -174,6 +174,7 @@ module Puma
       tcp_host: '::'.freeze,
       tcp_port: 9292,
       wait_for_less_busy_worker: 0.005,
+      warmup_before_fork: false,
       worker_boot_timeout: 60,
       worker_check_interval: 5,
       worker_culling_strategy: :youngest,

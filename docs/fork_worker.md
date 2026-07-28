@@ -31,6 +31,7 @@ The `fork_worker` option allows your application to be initialized only once for
 - As a general migration guide:
     - Copy any logic within your existing `before_fork` hook to the `before_refork` hook.
     - Consider to copy logic from your `before_worker_boot` hook to the `after_refork` hook, if it is needed to reset the state of worker 0 after it forks.
+- On Ruby 3.3+, worker 0 calls `Process.warmup` immediately before each refork (right after the `before_refork` hooks run) to GC and compact its heap first, maximizing the copy-on-write memory savings of the newly-forked workers. Off by default; opt in with `warmup_before_fork true`. Unlike the master's one-time boot-time warmup, this compacts worker 0's *live*, traffic-mutated heap -- any C extensions in use must be compaction-safe.
 
 ### Limitations
 

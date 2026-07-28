@@ -88,6 +88,7 @@ module Puma
                   restart_server.clear
                   @server.begin_restart(true)
                   @config.run_hooks(:before_refork, nil, @log_writer, @hook_data)
+                  warmup_before_fork
                 end
               elsif idx == -2 # refork cycle is done
                 @config.run_hooks(:after_refork, nil, @log_writer, @hook_data)
@@ -155,6 +156,25 @@ module Puma
       end
 
       private
+
+      # See `Cluster#warmup_before_fork` (cluster.rb) for the master-boot
+      # counterpart -- same behavior, but called here once per refork instead
+      # of once per master boot. Any exception raised by `Process.warmup`
+      # itself is rescued and logged (via `log`, not `error` -- see the
+      # comment on `Cluster#warmup_before_fork`) rather than propagated, so a
+      # bug in the GC/compaction path can't take down a refork.
+      def warmup_before_fork
+        return unless @options[:warmup_before_fork]
+
+        if Process.respond_to?(:warmup)
+          Process.warmup
+        else
+          debug "warmup_before_fork is enabled, but Process.warmup is not available " \
+            "on this Ruby version (added in Ruby 3.3); skipping"
+        end
+      rescue StandardError => e
+        log "! Process.warmup raised #{e.class}: #{e.message} — continuing boot without warmup"
+      end
 
       def spawn_worker(idx)
         @config.run_hooks(:before_worker_fork, idx, @log_writer, @hook_data)

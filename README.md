@@ -147,6 +147,13 @@ preload_app!
 
 Preloading can’t be used with phased restart, since phased restart kills and restarts workers one-by-one, and preloading copies the code of master into the workers.
 
+On Ruby 3.3+, Puma can also call [`Process.warmup`](https://docs.ruby-lang.org/en/master/Process.html#method-c-warmup) in the master process immediately before it forks the first worker (and again in worker 0 immediately before each refork, see [fork_worker](docs/fork_worker.md)). This runs a full GC and compacts and promotes the heap, so the pages shared with workers via copy-on-write start out compact instead of being dirtied by each worker's first GC cycle, reducing per-worker memory usage. This is controlled by the `warmup_before_fork` setting, which defaults to `false` (opt-in) and is a harmless no-op on older Rubies. Cluster mode only; single-mode servers do not fork.
+
+```ruby
+# config/puma.rb
+warmup_before_fork true
+```
+
 #### Cluster mode hooks
 
 When using clustered mode, Puma's configuration DSL provides `before_fork`, `before_worker_boot`, and `after_worker_shutdown`
