@@ -497,6 +497,172 @@ class TestBinderParallel < TestBinderBase
   end
 end
 
+# Per-worker `SO_REUSEPORT` listeners, driven through the binder directly.
+# `test_integration_cluster.rb` covers the same option through a booted cluster.
+class TestBinderReusePort < PumaTest
+  include TmpPath
+
+  def setup
+    @log_writer = Puma::LogWriter.strings
+    @binders = []
+  end
+
+  def teardown
+    @binders.each do |binder|
+      binder.close
+      binder.close_listeners
+    end
+    super
+  end
+
+  def test_off_by_default
+    refute new_binder.reuse_port_per_worker?
+  end
+
+  def test_off_outside_cluster_mode
+    refute new_binder(workers: 0, reuse_port_per_worker: true).reuse_port_per_worker?
+  end
+
+  def test_falls_back_where_the_platform_does_not_distribute
+    skip 'SO_REUSEPORT distributes on this platform' if Puma::Binder::SO_REUSEPORT_DISTRIBUTES
+
+    refute new_binder(reuse_port_per_worker: true).reuse_port_per_worker?
+    assert_includes @log_writer.stdout.string, 'Falling back to the listener inherited from the master'
+  end
+
+  def test_force_overrides_the_platform_check
+    skip_unless_reuse_port
+
+    assert new_binder(reuse_port_per_worker: :force).reuse_port_per_worker?
+  end
+
+  # The master reserves the address, so a port clash is still caught at boot, but
+  # must not listen on it: it would be one more socket in the reuse-port group
+  # that nothing ever calls accept on.
+  def test_master_binds_the_address_without_listening_on_it
+    skip_unless_reuse_port
+
+    port = UniquePort.call
+    binder = reuse_port_binder "tcp://127.0.0.1:#{port}"
+
+    assert_equal 1, binder.ios.size
+
+    # Nothing is listening, so the connect is refused (Linux) or the SYN is
+    # dropped and it times out (Darwin). Either way it must not connect.
+    connected =
+      begin
+        Socket.tcp('127.0.0.1', port, connect_timeout: 0.5, &:close)
+        true
+      rescue SystemCallError, IOError # IO::TimeoutError is an IOError
+        false
+      end
+
+    refute connected, 'the master must not be listening on the bind address'
+  end
+
+  def test_rebind_replaces_the_listener_and_closes_the_inherited_one
+    skip_unless_reuse_port
+
+    port = UniquePort.call
+    binder = reuse_port_binder "tcp://127.0.0.1:#{port}"
+    inherited = binder.ios.first
+
+    refute binder.reuse_port_listeners?
+    assert_equal 1, binder.rebind_tcp_listeners_for_reuse_port
+    assert binder.reuse_port_listeners?
+
+    listener = binder.ios.first
+    refute_same inherited, listener
+    assert inherited.closed?, 'the inherited listener should be closed'
+    assert_equal port, listener.local_address.ip_port
+    assert_same listener, binder.listeners.first.last
+
+    # and unlike the one the master holds, it accepts
+    client = TCPSocket.new '127.0.0.1', port
+    accepted = listener.accept
+    assert_equal '127.0.0.1', accepted.peeraddr[3]
+    accepted.close
+    client.close
+  end
+
+  def test_rebind_keeps_the_backlog_the_bind_asked_for
+    skip_unless_reuse_port
+
+    port = UniquePort.call
+    binder = reuse_port_binder "tcp://127.0.0.1:#{port}?backlog=2048"
+
+    backlogs = []
+    binder.stub :reuse_port_tcp_server, ->(_h, _p, _l, backlog:) {
+      backlogs << backlog
+      TCPServer.new '127.0.0.1', UniquePort.call
+    } do
+      binder.rebind_tcp_listeners_for_reuse_port
+    end
+
+    assert_equal [2048], backlogs
+  end
+
+  # A bind that fails after others have succeeded must not leave the sockets it
+  # already bound behind as leaked descriptors.
+  def test_rebind_closes_what_it_bound_when_a_later_bind_fails
+    skip_unless_reuse_port
+
+    binder = reuse_port_binder "tcp://127.0.0.1:#{UniquePort.call}",
+                               "tcp://127.0.0.1:#{UniquePort.call}"
+    inherited = binder.ios.dup
+    calls = 0
+    first = nil
+
+    binder.stub :reuse_port_tcp_server, ->(_h, _p, _l, backlog:) {
+      calls += 1
+      raise Errno::EADDRINUSE if calls > 1
+      first = TCPServer.new '127.0.0.1', UniquePort.call
+    } do
+      assert_raises(Errno::EADDRINUSE) { binder.rebind_tcp_listeners_for_reuse_port }
+    end
+
+    assert first.closed?, 'the listener bound before the failure should be closed'
+    assert_equal inherited, binder.ios
+    inherited.each { |io| refute io.closed?, 'an inherited listener should not be closed' }
+    refute binder.reuse_port_listeners?
+  end
+
+  def test_rebind_leaves_unix_listeners_alone
+    skip_unless_reuse_port
+    skip_unless :unix
+
+    path = tmp_path '.sock'
+    File.unlink path if File.exist? path
+    binder = reuse_port_binder "unix://#{path}", "tcp://127.0.0.1:#{UniquePort.call}"
+    unix_io = binder.ios.find { |io| io.is_a? UNIXServer }
+
+    assert_equal 1, binder.rebind_tcp_listeners_for_reuse_port
+    assert_same unix_io, binder.ios.find { |io| io.is_a? UNIXServer }
+    refute unix_io.closed?, 'the unix listener should be untouched'
+  end
+
+  private
+
+  def skip_unless_reuse_port
+    skip 'SO_REUSEPORT is not available' unless Puma::Binder::HAS_SO_REUSEPORT
+  end
+
+  def new_binder(**options)
+    config = Puma::Configuration.new({ workers: 2 }.merge(options))
+    config.clamp
+    binder = Puma::Binder.new @log_writer, config.options
+    @binders << binder
+    binder
+  end
+
+  # `:force` so these run where `SO_REUSEPORT` does not spread connections.
+  def reuse_port_binder(*binds)
+    binder = new_binder reuse_port_per_worker: :force
+    binder.parse binds, @log_writer
+    binder
+  end
+end unless ::Puma::IS_JRUBY
+
 class TestBinderSingle < TestBinderBase
   def test_ssl_binder_sets_backlog
     skip_unless :ssl

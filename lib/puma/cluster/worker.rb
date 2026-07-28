@@ -58,6 +58,10 @@ module Puma
         @config.run_hooks(:before_worker_boot, index, @log_writer, @hook_data)
 
         begin
+          # With `reuse_port_per_worker` this worker binds its own listeners and
+          # drops the ones it inherited. It has to happen before the server
+          # starts, because that is when the listeners are selected on.
+          @launcher.binder.rebind_tcp_listeners_for_reuse_port
           @server = start_server
         rescue Exception => e
           log "! Unable to start worker"

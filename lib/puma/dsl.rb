@@ -1365,6 +1365,54 @@ module Puma
       @options[:wait_for_less_busy_worker] = val.to_f
     end
 
+    # Give each cluster worker a listening socket of its own, bound with
+    # `SO_REUSEPORT` on the same address, instead of every worker accepting from
+    # the single socket the master binds and they inherit through `fork`.
+    #
+    # Workers no longer race one another for a connection, so those workers skip
+    # the {#wait_for_less_busy_worker} delay, and the thread pool mutex it takes
+    # on every accept-ready iteration of the loop.
+    #
+    # Only TCP binds are affected; SSL and UNIX binds keep the inherited socket.
+    #
+    # Requires cluster mode and a platform where `SO_REUSEPORT` spreads incoming
+    # connections over the sockets bound to the address, which is Linux. On
+    # Darwin and the BSDs the option only permits the duplicate bind and every
+    # new connection goes to whichever socket bound most recently, so a single
+    # worker would serve all traffic. Where the platform does not qualify, Puma
+    # logs a warning at boot and keeps the inherited listener.
+    #
+    # Two behaviours change when this is on, both because the master no longer
+    # owns a listening socket:
+    #
+    # * The master binds the address, so a port clash is still reported at boot,
+    #   but does not listen on it. A connection arriving before the first worker
+    #   has booted is refused rather than queued.
+    # * A hot restart (`SIGUSR2`) stops every worker before the replacements
+    #   bind, so connections are refused for the length of the restart. A phased
+    #   restart (`SIGUSR1`) is unaffected: replacements bind while the workers
+    #   they replace are still serving.
+    #
+    # Passing `:force` binds per-worker listeners even where `SO_REUSEPORT` does
+    # not distribute. That is for measuring the mechanism, not for running: on
+    # those platforms one worker receives every connection.
+    #
+    # The default is +false+.
+    #
+    # @example
+    #   reuse_port_per_worker
+    #
+    # @note Cluster mode only.
+    #
+    # @see Puma::Binder#rebind_tcp_listeners_for_reuse_port
+    # @see Puma::Server#handle_servers
+    #
+    # @version 8.1.0
+    #
+    def reuse_port_per_worker(val = true)
+      @options[:reuse_port_per_worker] = val == :force ? :force : !!val
+    end
+
     # Control how the remote address of the connection is set. This
     # is configurable because to calculate the true socket peer address
     # a kernel syscall is required which for very fast rack handlers

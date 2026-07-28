@@ -168,6 +168,7 @@ module Puma
       raise_exception_on_sigterm: true,
       reaping_time: 1,
       remote_address: :socket,
+      reuse_port_per_worker: false,
       silence_fork_callback_warning: false,
       silence_single_worker_warning: false,
       tag: File.basename(Dir.getwd),
