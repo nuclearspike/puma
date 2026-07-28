@@ -103,6 +103,7 @@ module Puma
 
       @requests_served = 0
       @hijacked = false
+      @hijack_proc = nil
 
       @http_content_length_limit = nil
       @http_content_length_limit_exceeded = nil

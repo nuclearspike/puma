@@ -108,7 +108,10 @@ module Puma
       end
 
       @env[HIJACK_P] = true
-      @env[HIJACK] = method(:full_hijack).to_proc
+      # The receiver (self) never changes across requests on the same
+      # connection, so the Method+Proc pair is memoized on the instance
+      # instead of rebuilt every request; #reset does not need to clear it.
+      @env[HIJACK] = (@hijack_proc ||= method(:full_hijack).to_proc)
 
       @env[RACK_INPUT] = @body || EmptyBody
       @env[RACK_URL_SCHEME] ||= default_server_port == PORT_443 ? HTTPS : HTTP
