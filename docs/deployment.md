@@ -43,6 +43,42 @@ For most deployments, adding `concurrent-ruby` and using `workers :auto` is the 
 
 See [`workers :auto` gotchas](../lib/puma/dsl.rb).
 
+## YJIT
+
+Puma can turn on [YJIT](https://docs.ruby-lang.org/en/master/YJIT/README_md.html)
+itself — you don't need to pass `--yjit`/`RUBYOPT=--yjit` on the command line.
+Add this to your Puma config:
+
+```ruby
+yjit true
+```
+
+This calls `RubyVM::YJIT.enable` as early as possible during boot (Ruby 3.3+;
+it's a silent no-op on older Rubies and on engines that don't define
+`RubyVM::YJIT`, such as JRuby). In cluster mode it's enabled exactly once, in
+the master, before the first worker is forked, so every worker inherits the
+already-enabled JIT rather than each one compiling it independently. The boot
+log always reports the current state, whether it came from this option or from
+`--yjit` set externally:
+
+```
+* Ruby version: ruby 3.3.11 (2026-03-26 revision 1f2d15125a) [arm64-darwin25]
+*         YJIT: enabled
+```
+
+It's off by default, matching stock Ruby/Puma behavior. Puma's own per-request
+path (env normalization, header handling, response writing, the thread pool
+loop) is pure Ruby and JITs well, in addition to whatever the application
+itself gains. Local measurements (5-repetition medians, single bind, `wrk`)
+showed **+24.8% requests/sec** in single mode (30,182 -> 37,667 rps) and
+**+10.8%** in an 8-worker cluster (94,426 -> 104,593 rps), with YJIT confirmed
+enabled in all 8 forked workers.
+
+The trade-off is memory: YJIT's compiled-code region adds to each process's
+RSS. That interacts directly with the "Don't set memory limits unless
+necessary" guidance below — budget for it the same way you'd budget for extra
+threads per worker.
+
 ## Worker utilization
 
 **How do you know if you've got enough (or too many workers)?**

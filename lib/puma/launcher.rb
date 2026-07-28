@@ -58,6 +58,14 @@ module Puma
       @options[:log_writer] = @log_writer
       @options[:logger] = @log_writer if clustered?
 
+      # As early as practical (now that @log_writer exists, so a failure
+      # can be reported), so that in cluster mode the master enables YJIT
+      # once here, before `Cluster#run` forks any workers — every worker
+      # then inherits the already-enabled JIT instead of each independently
+      # compiling it. In single mode this simply enables it before the app
+      # boots. See `enable_yjit` below.
+      enable_yjit
+
       @events = launcher_args[:events] || Events.new
 
       @argv = launcher_args[:argv] || []
@@ -339,6 +347,29 @@ module Puma
 
     def clustered?
       (@options[:workers] || 0) > 0
+    end
+
+    # Enables YJIT when configured via `yjit true` (see Puma::DSL#yjit) and
+    # supported by the running Ruby. `RubyVM::YJIT.enable` was added in Ruby
+    # 3.3; older supported Rubies (Puma requires >= 3.0) and non-MRI engines
+    # such as JRuby don't define `RubyVM::YJIT` at all, so both are guarded
+    # against rather than assumed.
+    #
+    # A failed `enable` (unexpected, but this runs at boot and shouldn't be
+    # able to take the whole server down) is logged and swallowed rather
+    # than raised — matching how `Configuration#run_hooks` treats a failing
+    # user hook. `Runner#output_header`'s YJIT line always reflects the
+    # live `RubyVM::YJIT.enabled?` state, so it correctly reports "disabled"
+    # if enabling didn't actually take effect.
+    #
+    # @see Puma::Runner#output_header for the corresponding boot log line
+    def enable_yjit
+      return unless @options[:yjit]
+      return unless defined?(RubyVM::YJIT) && RubyVM::YJIT.respond_to?(:enable)
+
+      RubyVM::YJIT.enable
+    rescue => e
+      @log_writer.log "! WARNING: `yjit true` was set, but RubyVM::YJIT.enable failed: #{e.class}: #{e.message}"
     end
 
     def unsupported(str)
