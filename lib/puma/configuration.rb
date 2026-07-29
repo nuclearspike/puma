@@ -180,6 +180,7 @@ module Puma
       worker_shutdown_timeout: 30,
       worker_timeout: 60,
       workers: 0,
+      yjit: false,
     }
 
     def initialize(user_options={}, default_options = {}, env = ENV, &block)
