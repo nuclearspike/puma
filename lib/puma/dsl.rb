@@ -1138,6 +1138,31 @@ module Puma
       @options[:warmup_before_fork] = enabled
     end
 
+    # Enable YJIT, Ruby's just-in-time compiler, as early as practical during
+    # boot. Puma's own per-request path (env normalization, header handling,
+    # response writing) is pure Ruby and JITs well, in addition to whatever
+    # benefit the application itself gets.
+    #
+    # In cluster mode, YJIT is enabled once in the master, before the first
+    # worker is forked, so every worker inherits the already-enabled JIT
+    # rather than each one compiling it independently.
+    #
+    # Requires Ruby 3.3+ (`RubyVM::YJIT.enable`). This is a silent no-op on
+    # older Rubies, and on engines that don't define `RubyVM::YJIT` (e.g.
+    # JRuby) — check the boot log's `YJIT:` line to confirm the running state.
+    #
+    # The default is +false+, matching stock Ruby/Puma behavior.
+    #
+    # @example
+    #   yjit true
+    #
+    # @see Puma::Launcher#enable_yjit
+    # @see Puma::Runner#output_header
+    #
+    def yjit(answer=true)
+      @options[:yjit] = answer
+    end
+
     # Use +obj+ or +block+ as the low level error handler. This allows the
     # configuration file to change the default error on the server.
     #

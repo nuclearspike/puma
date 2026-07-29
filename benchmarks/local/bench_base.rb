@@ -124,6 +124,14 @@ module TestPuma
           @duration = arg.to_i
         end
 
+        o.on "-b", "--body-conf BODYCONF", String, "CI RackUp: body types and sizes, eg 'ac10,50'" do |arg|
+          types = arg[TYPES_RE]
+          sizes = arg[SIZES_RE]
+          raise OptionParser::InvalidArgument, arg unless types || sizes
+          @body_types = TYPES.select { |pre, _| types.include? pre.to_s } if types
+          @body_sizes = sizes.split(',').map(&:to_i) if sizes
+        end
+
         o.on "-d", "--dly_app DELAYAPP", Float, "CI RackUp: app response delay" do |arg|
           @dly_app = arg.to_f
         end

@@ -166,6 +166,24 @@ class TestIntegrationCluster < TestIntegration
     assert_empty zombies, "Process ids #{zombies} became zombies"
   end
 
+  # The control server's listen thread must be stopped before its listener
+  # is closed, otherwise the ctl thread's IO.select raises Errno::EBADF on
+  # BSD/macOS and 'Exception handling servers' is logged during shutdown.
+  def test_term_with_control_server_no_ebadf
+    skip_unless_signal_exist? :TERM
+
+    cli_server "-w #{workers} #{set_pumactl_args} test/rackup/hello.ru", merge_err: true
+
+    get_worker_pids # wait for workers to boot
+
+    _, status = stop_server
+
+    assert_equal 15, status
+
+    @server_log << @server.read.to_s # drain log output written during shutdown
+    refute_includes @server_log, 'Exception handling servers'
+  end
+
   # mimicking stuck workers, test respawn with external TERM
   def test_stuck_external_term_spawn
     worker_respawn(0) do |phase0_worker_pids|
@@ -407,6 +425,21 @@ class TestIntegrationCluster < TestIntegration
       end
     CONFIG
     assert_equal '0', read_body(connect)
+  end
+
+  def test_yjit_enabled_in_all_workers
+    skip "RubyVM::YJIT.enable unavailable on this Ruby" unless defined?(RubyVM::YJIT) && RubyVM::YJIT.respond_to?(:enable)
+
+    cli_server '', config: <<~CONFIG
+      workers 2
+      yjit true
+      app { |_| [200, {}, [RubyVM::YJIT.enabled?.to_s]] }
+    CONFIG
+
+    get_worker_pids 0, 2
+
+    assert_includes @server_log, 'YJIT: enabled'
+    6.times { assert_equal 'true', read_body(connect) }
   end
 
   def test_phased_restart_with_fork_worker_and_high_worker_count
