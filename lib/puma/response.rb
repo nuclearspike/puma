@@ -31,6 +31,16 @@ module Puma
 
     CUSTOM_STAT = 'CUSTOM'
 
+    # Used to avoid an unconditional `#downcase` allocation for response
+    # header keys, which Rack 3 already requires to be lowercase.
+    UPPERCASE_CHAR = /[A-Z]/.freeze
+
+    # Return value of `#str_headers`, consumed only by `#prepare_response`.
+    # A Struct (not Hash) so every instance shares one monomorphic shape and
+    # `[]`/`[]=` keep working exactly like the Hash literal it replaces.
+    RespInfo = Struct.new(:no_body, :allow_chunked, :keep_alive, :content_length,
+                           :transfer_encoding, :response_hijack)
+
     include Puma::Const
 
     # Takes the request contained in +client+, invokes the Rack application to construct
@@ -425,7 +435,7 @@ module Puma
     # @param io_buffer [Puma::IOBuffer] modified inn place
     # @param force_keep_alive [Boolean] 'anded' with keep_alive, based on system
     #   status and `@max_keep_alive`
-    # @return [Hash] resp_info
+    # @return [Puma::Response::RespInfo] resp_info
     # @version 5.0.3
     #
     def str_headers(env, status, headers, res_body, io_buffer, force_keep_alive)
@@ -433,13 +443,16 @@ module Puma
       line_ending = LINE_END
       colon = COLON
 
-      resp_info = {}
+      resp_info = RespInfo.new
       resp_info[:no_body] = env[REQUEST_METHOD] == HEAD
 
       http_11 = env[SERVER_PROTOCOL] == HTTP_11
       if http_11
         resp_info[:allow_chunked] = true
-        resp_info[:keep_alive] = env.fetch(HTTP_CONNECTION, "").downcase != CLOSE
+        # Avoids allocating a downcased copy of the request's Connection
+        # header value when it's already lowercase (the common case).
+        conn = env.fetch(HTTP_CONNECTION, "")
+        resp_info[:keep_alive] = (conn.match?(UPPERCASE_CHAR) ? conn.downcase : conn) != CLOSE
 
         # An optimization. The most common response is 200, so we can
         # reply with the proper 200 status without having to compute
@@ -454,7 +467,8 @@ module Puma
         end
       else
         resp_info[:allow_chunked] = false
-        resp_info[:keep_alive] = env.fetch(HTTP_CONNECTION, "").downcase == KEEP_ALIVE
+        conn = env.fetch(HTTP_CONNECTION, "")
+        resp_info[:keep_alive] = (conn.match?(UPPERCASE_CHAR) ? conn.downcase : conn) == KEEP_ALIVE
 
         # Same optimization as above for HTTP/1.1
         #
@@ -480,7 +494,9 @@ module Puma
       headers.each do |k, vs|
         next if illegal_header_key?(k)
 
-        key = k.downcase
+        # Rack 3 requires response header keys to already be lowercase;
+        # only pay for the downcase copy when that's actually violated.
+        key = k.match?(UPPERCASE_CHAR) ? k.downcase : k
         case key
         when CONTENT_LENGTH2
           next if illegal_header_value?(vs)
