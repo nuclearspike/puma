@@ -3,6 +3,7 @@
 require_relative "helper"
 require_relative "helpers/integration"
 
+require "puma/binder"
 require "puma/configuration"
 
 require "time"
@@ -50,6 +51,47 @@ class TestIntegrationCluster < TestIntegration
   def test_phased_restart_does_not_drop_connections_unix
     restart_does_not_drop_connections num_threads: 1, total_requests: 1_000,
       signal: :USR1, unix: true, config: "preload_app! false"
+  end
+
+  # Replacement workers bind their own listeners while the workers they replace
+  # are still holding theirs, which is what `SO_REUSEPORT` permits and what a
+  # phased restart needs. Forced, so the per-worker listeners are exercised even
+  # where `SO_REUSEPORT` does not spread connections.
+  def test_phased_restart_does_not_drop_connections_reuse_port_per_worker
+    skip_unless_reuse_port
+
+    restart_does_not_drop_connections num_threads: 1, total_requests: 1_000,
+      signal: :USR1, config: "preload_app! false\nreuse_port_per_worker :force"
+  end
+
+  # Every worker has to serve some of the requests with `reuse_port_per_worker`
+  # on. Where `SO_REUSEPORT` spreads connections that is the kernel doing it over
+  # the per-worker listeners; where it does not, Puma must have fallen back to
+  # the listener inherited from the master, which spreads them itself.
+  def test_reuse_port_per_worker_serves_from_every_worker
+    counts = reuse_port_request_counts 'reuse_port_per_worker', 120
+
+    unless Puma::Binder::SO_REUSEPORT_DISTRIBUTES
+      assert_includes @server_log, 'Falling back to the listener inherited from the master'
+    end
+
+    counts.each_with_index do |count, idx|
+      assert_operator count, :>, 0, "worker #{idx} served none of #{counts.sum}: #{counts.inspect}"
+    end
+  end
+
+  # The mechanism itself: every worker closing the listener it inherited and
+  # binding its own must lose no requests. Forced, so this runs on platforms
+  # where `SO_REUSEPORT` does not distribute -- which is why the spread over
+  # workers is deliberately not asserted here, only that all of it was served.
+  def test_reuse_port_per_worker_forced_serves_every_request
+    skip_unless_reuse_port
+
+    total  = 120
+    counts = reuse_port_request_counts 'reuse_port_per_worker :force', total
+
+    assert_includes @server_log, 'Per-worker SO_REUSEPORT listeners'
+    assert_equal total, counts.sum, "workers accounted for #{counts.sum} of #{total} requests"
   end
 
   def test_pre_existing_unix
@@ -755,6 +797,38 @@ class TestIntegrationCluster < TestIntegration
   end
 
   private
+
+  def skip_unless_reuse_port
+    skip 'SO_REUSEPORT is not available' unless Puma::Binder::HAS_SO_REUSEPORT
+  end
+
+  # Boots a 4 worker cluster with +option+ in its config, sends +total+ requests,
+  # and returns each worker's `requests_count` as the control server reports it.
+  def reuse_port_request_counts(option, total)
+    reuse_port_workers = 4
+
+    cli_server "-w #{reuse_port_workers} -t 1:1 #{set_pumactl_args unix: true} test/rackup/hello.ru",
+      config: "#{option}\nworker_check_interval 1"
+    get_worker_pids 0, reuse_port_workers
+
+    total.times do
+      socket = connect
+      assert_equal 'Hello World', read_body(socket)
+      socket.close
+    end
+
+    # Workers report their counters to the master every `worker_check_interval`,
+    # so wait for what we sent to show up before reading the spread.
+    counts = []
+    deadline = Process.clock_gettime(Process::CLOCK_MONOTONIC) + 15
+    loop do
+      counts = get_stats['worker_status'].map { |w| w.dig('last_status', 'requests_count').to_i }
+      break if counts.sum >= total
+      break if Process.clock_gettime(Process::CLOCK_MONOTONIC) > deadline
+      sleep 0.25
+    end
+    counts
+  end
 
   def worker_timeout(timeout, iterations, details, config, log: nil)
     cli_server "-w #{workers} -t 1:1 test/rackup/hello.ru", config: config

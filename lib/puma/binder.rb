@@ -18,6 +18,22 @@ module Puma
 
     RACK_VERSION = [1,6].freeze
 
+    # `SO_REUSEPORT` lets several sockets bind the same address. What the kernel
+    # then does with an incoming connection is platform specific: Linux spreads
+    # connections over the sockets in the group, while Darwin and the BSDs only
+    # permit the duplicate bind and hand every new connection to whichever socket
+    # bound most recently (measured on arm64-darwin25: four listeners, 200
+    # connections, all 200 to the last one to bind). FreeBSD's load balancing
+    # variant is a separate option, `SO_REUSEPORT_LB`, absent on Darwin.
+    # @version 8.1.0
+    HAS_SO_REUSEPORT = ::Socket.const_defined?(:SO_REUSEPORT)
+
+    # Whether `SO_REUSEPORT` on this platform spreads incoming connections over
+    # the sockets bound to the address, rather than only permitting the bind.
+    # @version 8.1.0
+    SO_REUSEPORT_DISTRIBUTES = HAS_SO_REUSEPORT &&
+      RbConfig::CONFIG['host_os'].to_s.match?(/linux/i)
+
     def initialize(log_writer, options, env: ENV)
       @log_writer = log_writer
       @options = options
@@ -51,6 +67,12 @@ module Puma
 
       @envs = {}
       @ios = []
+
+      # Backlog of each TCP listener, keyed by file descriptor, so a worker
+      # binding its own `SO_REUSEPORT` socket can reproduce it.
+      @tcp_backlogs = {}
+      @reuse_port_per_worker = nil
+      @reuse_port_listeners = false
     end
 
     attr_reader :ios
@@ -153,6 +175,9 @@ module Puma
     def parse(binds, log_writer = nil, log_msg = 'Listening')
       before_parse.each(&:call)
       log_writer ||= @log_writer
+      # Resolve, and log, the reuse-port decision once before any listener is
+      # created, so it is reported even when no bind reaches `add_tcp_listener`.
+      reuse_port_per_worker?
       binds.each do |str|
         uri = URI.parse str
         case uri.scheme
@@ -341,14 +366,24 @@ module Puma
       end
 
       host = host[1..-2] if host&.start_with? '['
-      tcp_server = TCPServer.new(host, port)
 
-      if optimize_for_latency
-        tcp_server.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+      if reuse_port_per_worker?
+        # Reserve the address, and prove it can be bound, without listening on
+        # it: the workers own the listening sockets in this mode, and a listening
+        # socket here would be one more member of the reuse-port group that
+        # nothing ever calls accept on.
+        tcp_server = reuse_port_tcp_server host, port, optimize_for_latency, backlog: nil
+      else
+        tcp_server = TCPServer.new(host, port)
+
+        if optimize_for_latency
+          tcp_server.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1)
+        end
+        tcp_server.setsockopt(Socket::SOL_SOCKET,Socket::SO_REUSEADDR, true)
+        tcp_server.listen backlog
       end
-      tcp_server.setsockopt(Socket::SOL_SOCKET,Socket::SO_REUSEADDR, true)
-      tcp_server.listen backlog
 
+      @tcp_backlogs[tcp_server.to_i] = backlog
       @ios << tcp_server
       tcp_server
     end
@@ -356,8 +391,103 @@ module Puma
     def inherit_tcp_listener(host, port, fd)
       s = fd.kind_of?(::TCPServer) ? fd : ::TCPServer.for_fd(fd)
 
+      # A socket inherited from a master that was running with
+      # `reuse_port_per_worker` is bound but not listening. If this process is
+      # not in that mode nothing else is going to listen on it.
+      s.listen 1024 if !reuse_port_per_worker? && not_listening?(s)
+
       @ios << s
       s
+    end
+
+    # Should this process create per-worker `SO_REUSEPORT` listeners rather than
+    # share the single socket the master binds? Resolved once per process; a
+    # worker inherits the answer, and the fact that any warning was already
+    # logged, through `fork`.
+    #
+    # @version 8.1.0
+    def reuse_port_per_worker?
+      return @reuse_port_per_worker unless @reuse_port_per_worker.nil?
+
+      requested = @options[:reuse_port_per_worker]
+
+      @reuse_port_per_worker =
+        if !requested || @options.fetch(:workers, 0) < 1
+          false
+        elsif !HAS_SO_REUSEPORT
+          reuse_port_unavailable "this platform has no SO_REUSEPORT"
+        elsif !SO_REUSEPORT_DISTRIBUTES && requested != :force
+          reuse_port_unavailable "SO_REUSEPORT on #{RbConfig::CONFIG['host_os']} " \
+            "hands every new connection to the socket that bound most recently " \
+            "instead of spreading them, so one worker would serve all traffic"
+        else
+          @log_writer.log "* Per-worker SO_REUSEPORT listeners: each worker binds its own socket"
+          true
+        end
+    end
+
+    # True once this process has replaced its inherited TCP listeners with its
+    # own `SO_REUSEPORT` sockets.
+    #
+    # @version 8.1.0
+    def reuse_port_listeners?
+      @reuse_port_listeners
+    end
+
+    # Replace every inherited TCP listener with one this process binds itself,
+    # with `SO_REUSEPORT`, on the same address and port, then close the inherited
+    # descriptor so this process no longer shares the master's accept queue.
+    # Called by each cluster worker before it starts its server.
+    #
+    # SSL and UNIX listeners are left alone and keep the inherited socket.
+    #
+    # Every replacement is bound before any inherited socket is closed, and a
+    # failure part way through closes the replacements it did bind, so this
+    # process is left with exactly the working listeners it started with.
+    #
+    # Call this before the server starts. It swaps entries in {#ios} and
+    # {#listeners} in place, which is only safe while nothing is accepting.
+    #
+    # @return [Integer] number of listeners replaced
+    # @version 8.1.0
+    def rebind_tcp_listeners_for_reuse_port
+      return 0 unless reuse_port_per_worker?
+
+      bound = []
+
+      rebound =
+        begin
+          @ios.grep(::TCPServer).map do |old_io|
+            addr    = old_io.local_address
+            backlog = @tcp_backlogs[old_io.to_i] || 1024
+            new_io  = reuse_port_tcp_server addr.ip_address, addr.ip_port,
+              tcp_nodelay?(old_io), backlog: backlog
+            bound << new_io
+            [old_io, new_io, backlog]
+          end
+        rescue Exception
+          bound.each { |io| io.close rescue nil }
+          raise
+        end
+
+      return 0 if rebound.empty?
+
+      @tcp_backlogs = {}
+
+      rebound.each do |old_io, new_io, backlog|
+        @tcp_backlogs[new_io.to_i] = backlog
+        @envs[new_io] = @envs.delete(old_io) if @envs.key?(old_io)
+        @listeners.each { |listener| listener[1] = new_io if listener[1].equal?(old_io) }
+        @ios[@ios.index(old_io)] = new_io
+
+        begin
+          old_io.close
+        rescue SystemCallError, IOError
+        end
+      end
+
+      @reuse_port_listeners = true
+      rebound.size
     end
 
     def add_ssl_listener(host, port, ctx,
@@ -485,6 +615,76 @@ module Puma
     end
 
     private
+
+    # Create a `TCPServer` with `SO_REUSEPORT` set *before* the bind, which is
+    # required rather than incidental: unless the first socket bound to an
+    # address carries the option, every later bind of that address fails with
+    # `EADDRINUSE`.
+    #
+    # A nil +backlog+ binds without listening.
+    #
+    # @version 8.1.0
+    def reuse_port_tcp_server(host, port, optimize_for_latency, backlog:)
+      error = nil
+
+      # AI_PASSIVE so a nil or empty host resolves to the wildcard address, which
+      # is what `TCPServer.new` does with the same argument.
+      Addrinfo.getaddrinfo(host, port, nil, :STREAM, nil, Socket::AI_PASSIVE).each do |ai|
+        sock = Socket.new ai.pfamily, ai.socktype, ai.protocol
+
+        begin
+          sock.setsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY, 1) if optimize_for_latency
+          sock.setsockopt Socket::SOL_SOCKET, Socket::SO_REUSEADDR, true
+          sock.setsockopt Socket::SOL_SOCKET, Socket::SO_REUSEPORT, true
+          sock.bind ai
+          sock.listen backlog if backlog
+        rescue SystemCallError => e
+          error = e
+          sock.close rescue nil
+          next
+        end
+
+        # Hand the descriptor over: the rest of Puma accepts from these and needs
+        # `TCPServer#accept_nonblock`, which returns a TCPSocket, rather than
+        # `Socket#accept_nonblock`, which returns a [Socket, Addrinfo] pair.
+        tcp_server = ::TCPServer.for_fd sock.fileno
+        sock.autoclose = false
+        return tcp_server
+      end
+
+      raise error || Errno::EADDRNOTAVAIL.new("#{host}:#{port}")
+    end
+
+    # @version 8.1.0
+    def tcp_nodelay?(io)
+      io.getsockopt(Socket::IPPROTO_TCP, Socket::TCP_NODELAY).bool
+    rescue SystemCallError
+      true
+    end
+
+    # Only true when the socket can be proven not to be listening, so that an
+    # inherited socket is never touched on a guess -- calling `listen` again
+    # would silently reset the backlog it was created with.
+    #
+    # Darwin does not answer `SO_ACCEPTCONN`, so there this is always false. A
+    # hot restart out of `reuse_port_per_worker` on Darwin therefore inherits a
+    # socket nothing listens on; that needs `:force`, which is documented as a
+    # measurement mode rather than one to run under.
+    #
+    # @version 8.1.0
+    def not_listening?(io)
+      return false unless Socket.const_defined?(:SO_ACCEPTCONN)
+      !io.getsockopt(Socket::SOL_SOCKET, Socket::SO_ACCEPTCONN).bool
+    rescue SystemCallError
+      false
+    end
+
+    # @version 8.1.0
+    def reuse_port_unavailable(reason)
+      @log_writer.log "! WARNING: `reuse_port_per_worker` is set but #{reason}."
+      @log_writer.log "! Falling back to the listener inherited from the master."
+      false
+    end
 
     # @!attribute [r] loopback_addresses
     def loopback_addresses

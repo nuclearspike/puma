@@ -17,6 +17,21 @@ class TestConfigFile < PumaTest
     assert_equal max_threads, conf.options.default_options[:max_threads]
   end
 
+  def test_reuse_port_per_worker_defaults_to_off
+    conf = Puma::Configuration.new
+    conf.clamp
+    assert_equal false, conf.options[:reuse_port_per_worker]
+  end
+
+  def test_reuse_port_per_worker_from_DSL
+    { [] => true, [true] => true, [false] => false, [:force] => :force }.each do |args, expected|
+      conf = Puma::Configuration.new { |c| c.reuse_port_per_worker(*args) }
+      conf.clamp
+      assert_equal expected, conf.options[:reuse_port_per_worker],
+        "reuse_port_per_worker(#{args.map(&:inspect).join ', '})"
+    end
+  end
+
   def test_app_from_rackup
     if Rack.release >= '3'
       fn = "test/rackup/hello-bind_rack3.ru"

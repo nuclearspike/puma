@@ -346,6 +346,13 @@ module Puma
         queue_requests = @queue_requests
         drain = options[:drain_on_shutdown] ? 0 : nil
 
+        # With a listener of its own a worker is not racing any other worker to
+        # accept, so there is nothing for the delay heuristic to arbitrate: skip
+        # it, and with it the `pool.busy_threads` mutex acquisition it needs on
+        # every accept-ready iteration.
+        accept_loop_delay = @cluster_accept_loop_delay if
+          @cluster_accept_loop_delay.on? && !@binder.reuse_port_listeners?
+
         addr_send_name, addr_value = case options[:remote_address]
         when :value
           [:peerip=, options[:remote_address_value]]
@@ -391,8 +398,8 @@ module Puma
 
                 unless shutting_down?
                   if @queue_requests
-                    if @cluster_accept_loop_delay.on? && (busy_threads_plus_todo = pool.busy_threads) > 0
-                      delay = @cluster_accept_loop_delay.calculate(
+                    if accept_loop_delay && (busy_threads_plus_todo = pool.busy_threads) > 0
+                      delay = accept_loop_delay.calculate(
                         max_threads: @max_threads,
                         busy_threads_plus_todo: busy_threads_plus_todo
                       )
