@@ -40,7 +40,7 @@ module TestPuma
       super
       # default values
       @duration ||= 10
-      max_threads = (@threads[/\d+\z/] || 5).to_i
+      max_threads = (@threads || 5).to_i
       @stream_threads ||= (0.8 * (@workers || 1) * max_threads).to_i
       connections = @stream_threads * (@connections || 2)
 
@@ -94,13 +94,15 @@ module TestPuma
       env_log
 
     rescue => e
-      puts e.class, e.message, e.backtrace
+      error = e
+      STDERR.syswrite "\nBenchmark failed - #{e.class}: #{e.message}\n  #{e.backtrace.join "\n  "}\n"
     ensure
       puts ''
-      @puma_info.run 'stop'
+      @puma_info&.run 'stop'
       sleep 2
       running_time = Process.clock_gettime(Process::CLOCK_MONOTONIC) - time_start
       puts format("\n%2d:%d Total Time", (running_time/60).to_i, running_time % 60)
+      exit 1 if error
     end
 
     # Prints parsed data of each wrk run. Similar to:
