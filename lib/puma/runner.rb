@@ -100,6 +100,7 @@ module Puma
       log "Puma starting in #{mode} mode..."
       log "* Puma version: #{Puma::Const::PUMA_VERSION} (\"#{Puma::Const::CODE_NAME}\")"
       log "* Ruby version: #{RUBY_DESCRIPTION}"
+      log "*         YJIT: #{yjit_status}"
       log "*  Min threads: #{min_t}"
       log "*  Max threads: #{max_t}"
       log "*  Environment: #{environment}"
@@ -182,6 +183,19 @@ module Puma
       unless Dir.exist?(File.dirname(path))
         raise "Cannot redirect #{io_name} to #{path}"
       end
+    end
+
+    # Reports the current runtime state of YJIT for the boot banner, regardless
+    # of *how* it got there — via Puma's own `yjit true` option (see
+    # Puma::Launcher#enable_yjit and Puma::DSL#yjit), or externally via
+    # `ruby --yjit` / `RUBYOPT=--yjit`.
+    #
+    # `RubyVM::YJIT` isn't defined at all on Rubies/engines without YJIT
+    # support (e.g. JRuby, or MRI built with `--disable-yjit`), hence "unavailable".
+    def yjit_status
+      return "unavailable" unless defined?(RubyVM::YJIT) && RubyVM::YJIT.respond_to?(:enabled?)
+
+      RubyVM::YJIT.enabled? ? "enabled" : "disabled"
     end
 
     def utc_iso8601(val)

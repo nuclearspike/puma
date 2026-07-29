@@ -106,6 +106,38 @@ class TestIntegrationSingle < TestIntegration
     assert_match("Hello World", reply)
   end
 
+  def test_yjit_enabled_when_configured
+    skip "RubyVM::YJIT.enable unavailable on this Ruby" unless defined?(RubyVM::YJIT) && RubyVM::YJIT.respond_to?(:enable)
+
+    cli_server '', config: <<~CONFIG
+      yjit true
+      app { |_| [200, {}, [RubyVM::YJIT.enabled?.to_s]] }
+    CONFIG
+
+    assert_equal 'true', read_body(connect)
+    assert_includes @server_log, 'YJIT: enabled'
+  end
+
+  def test_yjit_disabled_by_default
+    skip "RubyVM::YJIT unavailable on this Ruby" unless defined?(RubyVM::YJIT)
+
+    # Not hard-coded to 'false': mirrors whatever this Ruby's ambient YJIT
+    # state already is (e.g. CI's `ruby: head` jobs boot with
+    # RUBYOPT=--yjit, see .github/workflows/tests.yml). The point of this
+    # test is that Puma's `yjit` option -- which defaults to false -- does
+    # not itself change that state either way; `cli_server` spawns its
+    # subprocess from this same process's environment, so it inherits the
+    # same ambient RUBYOPT this assertion is built from.
+    expected = RubyVM::YJIT.enabled?.to_s
+
+    cli_server '', config: <<~CONFIG
+      app { |_| [200, {}, [RubyVM::YJIT.enabled?.to_s]] }
+    CONFIG
+
+    assert_equal expected, read_body(connect)
+    assert_includes @server_log, "YJIT: #{RubyVM::YJIT.enabled? ? 'enabled' : 'disabled'}"
+  end
+
   def test_term_not_accepts_new_connections
     skip_unless_signal_exist? :TERM
 
