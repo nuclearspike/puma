@@ -1,3 +1,26 @@
+> ### This is a fork
+>
+> This fork adds bug fixes and **opt-in** performance settings on the `heroku-perf` branch.
+> Every change was measured on real hardware against a same-commit control arm, and each one
+> landed through its own pull request **against this fork's `heroku-perf` branch** — no pull
+> requests are open against upstream puma.
+>
+> | Change | Default | Measured effect |
+> |---|---|---|
+> | Benchmark-suite fixes | — | The primary `wrk` benchmark had been silently exiting 0 since Nov 2024 |
+> | `Errno::EBADF` shutdown fix | on | Exception logged on every cluster SIGTERM — gone |
+> | YJIT boot reporting + `yjit` | reporting on / setting off | **+24.8%** rps single, **+10.8%** cluster `-w8` |
+> | `warmup_before_fork` | off | **−51.6%** unshared memory per worker on a real Rails app (+0.73 s boot) |
+> | Per-request allocation cuts | on | **44.0 → 39.0** allocations per keep-alive request |
+> | `reuse_port_per_worker` | off | No measurable win on macOS; Linux-gated, see notes |
+>
+> On a 2 GB dyno, the memory change fits **9 workers where stock fits 6**.
+>
+> **Read [FORK-CHANGES.md](FORK-CHANGES.md)** for the full measurements, the method (locked
+> baselines, interleaved arms, medians of 3–5 reps), what to run before enabling
+> `warmup_before_fork`, the changes that were measured and *rejected*, and what remains
+> untested. Everything below this box is upstream puma's own README.
+
 <p align="center">
   <img src="docs/images/standard-logo.svg" alt="Puma logo">
 </p>
