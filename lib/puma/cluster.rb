@@ -349,6 +349,11 @@ module Puma
           log "Early termination of worker"
           exit! 0
         else
+          # Stop the control server before closing its listener: closing a
+          # socket that the control server's thread is blocked on in IO.select
+          # raises Errno::EBADF on BSD/macOS, logging 'Exception handling
+          # servers' during an otherwise clean shutdown.
+          stop_control
           @launcher.close_binder_listeners
 
           stop_workers
